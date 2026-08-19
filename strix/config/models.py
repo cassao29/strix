@@ -37,6 +37,8 @@ from openai.types.responses.response_usage import ResponseUsage
 from openai.types.shared import Reasoning
 
 from strix.config import codex
+from strix.config.claude_code_model import PREFIX as CLAUDE_CODE_PREFIX
+from strix.config.claude_code_model import ClaudeCodeModel
 from strix.config.loader import load_settings
 from strix.config.tool_call_ids import TurnCallIdRewriter, dedupe_input
 from strix.config.tool_call_limits import TurnToolCallLimiter
@@ -481,6 +483,10 @@ class StrixProvider(MultiProvider):
                 codex.get_subscription_client(),
                 reasoning_effort=llm.reasoning_effort,
             )
+        elif model_name and model_name.lower().startswith(f"{CLAUDE_CODE_PREFIX}/"):
+            # POC: Claude Pro/Max subscription via the local `claude` CLI
+            # (claude_agent_sdk), instead of a metered ANTHROPIC_API_KEY.
+            model = ClaudeCodeModel(model_name.split("/", 1)[1])
         else:
             model = super().get_model(model_name)
             if llm.disable_streaming:
