@@ -23,20 +23,32 @@ Strix turn, but the ``claude`` CLI's own agentic loop wants to own execution
 end to end, so delegation happens at the whole-turn granularity instead of
 per-tool-call.
 
-**Known limitation**: tools are invoked with a bare ``ToolContext(context={})``
-— there is no way to thread Strix's actual per-run context (coordinator,
-agent graph, sandbox session) through the ``Model`` interface, which is
-constructed generically from a model name string and has no run-context
-parameter. Tools written defensively against a missing coordinator (e.g.
-``finish_scan``) degrade gracefully; tools that hard-require agent-graph
-state will report that absence back to Claude as a normal tool error rather
-than crashing the turn. Only ``FunctionTool`` instances are bridged —
-``CustomTool`` (e.g. ``apply_patch``) is skipped with a warning, since its
-raw-string input convention doesn't map onto MCP's JSON-schema tools.
+**Run context**: bridged tools run with a real ``ToolContext`` rebuilt from
+the run-context dict ``execution.py`` publishes via
+:mod:`strix.config.run_context` (coordinator, ``agent_id``, budgets, ...), so
+coordination tools (``create_agent``, ``send_message_to_agent``, ...) operate
+on the live agent graph. Sandbox shell/filesystem tools bind to their
+``SandboxSession`` by closure at construction, not through the context dict,
+so they execute in the real sandbox regardless. Outside a run (e.g. a bare
+unit test) the context falls back to an empty dict.
+
+**Tool coverage**: both ``FunctionTool`` and ``CustomTool`` are bridged —
+``CustomTool`` (e.g. ``apply_patch``) is fronted with Strix's own
+``_custom_tool_as_function_tool`` adapter so its single raw-string payload
+maps onto an MCP JSON-schema tool. A wall-clock timeout
+(``_TURN_TIMEOUT_S``) bounds a wedged turn.
+
+**Residual mismatch worth knowing**: because the ``claude`` CLI owns its own
+agentic loop, one Strix turn is a whole delegated task rather than a single
+model step, so Strix's own per-turn budget/compaction/turn-guard machinery
+sees one long turn instead of many. Cost also reads as unmetered ($0): a
+subscription genuinely has no per-token price, and ``claude-code/*`` is not in
+LiteLLM's price table.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -63,6 +75,8 @@ from claude_agent_sdk import (
 from claude_agent_sdk import tool as sdk_tool
 from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 
+from strix.config.run_context import active_run_context
+
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -87,6 +101,10 @@ _MCP_SERVER_NAME = "strix"
 # Bound so a misbehaving delegated task can't run forever; generous because
 # one Strix turn now covers a whole delegated task, not a single tool call.
 _MAX_TURNS_WITH_TOOLS = 40
+# Wall-clock ceiling for a single delegated turn. A whole task can chain many
+# tool calls, so this is generous — it exists to stop a wedged CLI process
+# hanging the scan forever, not to bound normal work.
+_TURN_TIMEOUT_S = 1800.0
 
 
 class ClaudeCodeAuthError(RuntimeError):
@@ -131,15 +149,22 @@ def _make_bridge_tool(tool: FunctionTool) -> SdkMcpTool[Any]:
 
     Calling it invokes the real ``on_invoke_tool`` — the same coroutine
     Strix's own Runner would call — so the tool actually runs (shell
-    commands execute, proxy requests go out, reports get filed). See the
-    module docstring for the ``ToolContext(context={})`` limitation.
+    commands execute in the sandbox, proxy requests go out, reports get
+    filed). The ``ToolContext`` is rebuilt from the run context published by
+    ``execution.py`` (:mod:`strix.config.run_context`), so coordination tools
+    that read ``context["coordinator"]`` see the real graph; when no run
+    context is set (e.g. a bare unit test) it falls back to an empty dict.
     """
 
     async def _invoke(args: dict[str, Any]) -> dict[str, Any]:
         call_id = f"claude_code_{uuid.uuid4().hex}"
         args_json = json.dumps(args, ensure_ascii=False)
+        run_context = active_run_context.get() or {}
         ctx: ToolContext[Any] = ToolContext(
-            context={}, tool_name=tool.name, tool_call_id=call_id, tool_arguments=args_json
+            context=run_context,
+            tool_name=tool.name,
+            tool_call_id=call_id,
+            tool_arguments=args_json,
         )
         try:
             result = await tool.on_invoke_tool(ctx, args_json)
@@ -174,15 +199,30 @@ def _usage_from_result(message: ResultMessage) -> tuple[Usage, str | None]:
     return usage, error
 
 
+def _as_function_tool(tool: Tool) -> FunctionTool | None:
+    """Coerce a Strix tool into a bridgeable ``FunctionTool``, or ``None`` to skip.
+
+    ``CustomTool`` (e.g. ``apply_patch``) takes a single raw-string payload
+    rather than JSON args; Strix already ships an adapter that fronts it with a
+    ``{field: str}`` JSON schema for the chat-completions path, so reuse that
+    exact conversion instead of reinventing it.
+    """
+    if isinstance(tool, FunctionTool):
+        return tool
+    if isinstance(tool, CustomTool):
+        from strix.agents.factory import _custom_tool_as_function_tool  # noqa: PLC0415
+
+        return _custom_tool_as_function_tool(tool)
+    logger.warning("claude-code bridge: skipping unsupported tool type %s", type(tool).__name__)
+    return None
+
+
 def _build_mcp_bridge(tools: list[Tool]) -> McpSdkServerConfig | None:
-    function_tools = [t for t in tools if isinstance(t, FunctionTool)]
-    skipped = [t.name for t in tools if isinstance(t, CustomTool)]
-    if skipped:
-        logger.warning("claude-code bridge: skipping unsupported CustomTool(s): %s", skipped)
-    if not function_tools:
+    bridged = [ft for ft in (_as_function_tool(t) for t in tools) if ft is not None]
+    if not bridged:
         return None
     return create_sdk_mcp_server(
-        name=_MCP_SERVER_NAME, tools=[_make_bridge_tool(t) for t in function_tools]
+        name=_MCP_SERVER_NAME, tools=[_make_bridge_tool(t) for t in bridged]
     )
 
 
@@ -234,11 +274,16 @@ class ClaudeCodeModel(Model):
         tool_calls = 0
 
         try:
-            async for message in query(prompt=_stringify_input(input), options=options):
-                if isinstance(message, AssistantMessage):
-                    tool_calls += _collect_assistant_blocks(message, text_parts)
-                elif isinstance(message, ResultMessage):
-                    usage, turn_error = _usage_from_result(message)
+            async with asyncio.timeout(_TURN_TIMEOUT_S):
+                async for message in query(prompt=_stringify_input(input), options=options):
+                    if isinstance(message, AssistantMessage):
+                        tool_calls += _collect_assistant_blocks(message, text_parts)
+                    elif isinstance(message, ResultMessage):
+                        usage, turn_error = _usage_from_result(message)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"claude-code backend turn exceeded {_TURN_TIMEOUT_S:.0f}s and was aborted"
+            ) from exc
         except CLINotFoundError as exc:
             raise ClaudeCodeUnavailableError(
                 "claude CLI not found on PATH — install Claude Code and run `claude /login`"

@@ -21,6 +21,7 @@ from openai import (
 )
 
 from strix.config import codex
+from strix.config.run_context import active_run_context
 from strix.core.hooks import (
     BudgetExceededError,
     BudgetPausedError,
@@ -661,6 +662,11 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     logger.exception("proactive compaction failed for %s", agent_id)
                 with contextlib.suppress(Exception):
                     pre_run_items = list(await session.get_items())
+            # Publish the run context so the claude-code backend can rebuild a
+            # faithful ToolContext for tools it invokes over MCP. asyncio copies
+            # the current context into the run-loop task spawned here, so the
+            # value must be set before run_streamed; other backends ignore it.
+            run_ctx_token = active_run_context.set(context)
             stream = Runner.run_streamed(
                 agent,
                 input=input_data,
@@ -701,6 +707,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                         exc_info=True,
                     )
             finally:
+                active_run_context.reset(run_ctx_token)
                 await coordinator.detach_stream(agent_id, stream)
         except BudgetPausedError as exc:
             logger.info("agent %s paused at the scan budget limit: %s", agent_id, exc)
