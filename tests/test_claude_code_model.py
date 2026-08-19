@@ -23,6 +23,7 @@ from strix.config.claude_code_model import (
     ClaudeCodeModel,
     _as_function_tool,
     _build_mcp_bridge,
+    _LifecycleCapture,
     _make_bridge_tool,
 )
 from strix.config.run_context import active_run_context
@@ -60,7 +61,7 @@ async def test_bridge_tool_runs_real_callable() -> None:
     def echo_ctx(value: str) -> str:
         return f"echo:{value}"
 
-    bridge = _make_bridge_tool(echo_ctx)
+    bridge = _make_bridge_tool(echo_ctx, _LifecycleCapture())
     out = await _invoke_bridge(bridge, {"value": "hi"})
 
     assert out["is_error"] is False
@@ -75,7 +76,7 @@ async def test_bridge_tool_threads_context_into_tool() -> None:
         captured["ctx"] = ctx.context
         return "ok"
 
-    bridge = _make_bridge_tool(grab)
+    bridge = _make_bridge_tool(grab, _LifecycleCapture())
     token = active_run_context.set({"coordinator": "COORD", "agent_id": "a1"})
     try:
         await _invoke_bridge(bridge, {"value": "x"})
@@ -98,7 +99,7 @@ async def test_bridge_tool_reports_exception_as_error_result() -> None:
         params_json_schema={"type": "object", "properties": {}, "additionalProperties": False},
         on_invoke_tool=_raise,
     )
-    bridge = _make_bridge_tool(raw)
+    bridge = _make_bridge_tool(raw, _LifecycleCapture())
     out = await _invoke_bridge(bridge, {})
     assert out["is_error"] is True
     assert "kaboom" in out["content"][0]["text"]
@@ -115,12 +116,12 @@ def test_custom_tool_is_bridged_not_skipped() -> None:
     # Strix's adapter fronts the raw-string payload with a JSON-schema field.
     assert bridged.params_json_schema["type"] == "object"
 
-    server = _build_mcp_bridge([custom])
+    server = _build_mcp_bridge([custom], _LifecycleCapture())
     assert server is not None  # not dropped
 
 
 def test_build_mcp_bridge_empty_when_no_tools() -> None:
-    assert _build_mcp_bridge([]) is None
+    assert _build_mcp_bridge([], _LifecycleCapture()) is None
 
 
 async def test_text_only_turn_returns_text(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,6 +186,54 @@ async def test_turn_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     model = ClaudeCodeModel("sonnet")
     with pytest.raises(RuntimeError, match="turn failed"):
         await _get(model, tools=[])
+
+
+async def test_lifecycle_tool_intercepted_not_executed() -> None:
+    # finish_scan must NOT run inside the bridge — it is captured and re-emitted
+    # for Strix's Runner to execute once.
+    ran = {"called": False}
+
+    async def _run(_ctx: Any, _args: str) -> str:
+        ran["called"] = True
+        return "SHOULD NOT RUN"
+
+    finish = FunctionTool(
+        name="finish_scan",
+        description="finish",
+        params_json_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        on_invoke_tool=_run,
+    )
+    capture = _LifecycleCapture()
+    bridge = _make_bridge_tool(finish, capture)
+    out = await _invoke_bridge(bridge, {"executive_summary": "x"})
+
+    assert ran["called"] is False
+    assert capture.captured is True
+    assert capture.name == "finish_scan"
+    assert "success" in out["content"][0]["text"]
+
+
+async def test_get_response_reemits_captured_lifecycle_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Simulate Claude Code calling finish_scan over MCP (populates capture); the
+    # turn must return a real function_call item, not a text message.
+    def fake_bridge(_tools: Any, capture: _LifecycleCapture) -> None:
+        capture.record("finish_scan", '{"executive_summary":"done"}')
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:  # noqa: ARG001
+        yield _assistant("Finalizing now.")
+        yield _result()
+
+    monkeypatch.setattr(ccm, "_build_mcp_bridge", fake_bridge)
+    monkeypatch.setattr(ccm, "query", fake_query)
+    model = ClaudeCodeModel("sonnet")
+    resp = await _get(model, tools=[])
+
+    item = resp.output[0]
+    assert item.type == "function_call"
+    assert item.name == "finish_scan"
+    assert item.arguments == '{"executive_summary":"done"}'
 
 
 async def _get(model: ClaudeCodeModel, *, tools: list[Any]) -> Any:

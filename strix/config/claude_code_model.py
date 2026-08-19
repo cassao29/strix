@@ -38,10 +38,20 @@ unit test) the context falls back to an empty dict.
 maps onto an MCP JSON-schema tool. A wall-clock timeout
 (``_TURN_TIMEOUT_S``) bounds a wedged turn.
 
+**Finalization handshake**: lifecycle tools (``finish_scan`` / ``agent_finish``)
+are terminal in Strix — its Runner stops an agent the moment one succeeds. Since
+Claude Code runs its own loop, the bridge intercepts a lifecycle call (records
+args, returns a placeholder, runs nothing, stops consuming the CLI turn) and the
+turn re-emits it as a real function call. Strix's Runner then executes it exactly
+once, its ``tool_use_behavior`` produces the terminal ``final_output``, and the
+run ends cleanly — no work past the finish and no spurious "ended without calling
+finish_scan" error.
+
 **Residual mismatch worth knowing**: because the ``claude`` CLI owns its own
 agentic loop, one Strix turn is a whole delegated task rather than a single
 model step, so Strix's own per-turn budget/compaction/turn-guard machinery
-sees one long turn instead of many. Cost also reads as unmetered ($0): a
+sees one long turn instead of many, and token usage under-counts (only the
+final ``ResultMessage`` per turn is captured). Cost reads as unmetered ($0): a
 subscription genuinely has no per-token price, and ``claude-code/*`` is not in
 LiteLLM's price table.
 """
@@ -73,7 +83,11 @@ from claude_agent_sdk import (
     query,
 )
 from claude_agent_sdk import tool as sdk_tool
-from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseOutputMessage,
+    ResponseOutputText,
+)
 
 from strix.config.run_context import active_run_context
 
@@ -101,6 +115,11 @@ _MCP_SERVER_NAME = "strix"
 # Bound so a misbehaving delegated task can't run forever; generous because
 # one Strix turn now covers a whole delegated task, not a single tool call.
 _MAX_TURNS_WITH_TOOLS = 40
+# Lifecycle tools whose call ends a Strix agent. When Claude Code calls one over
+# MCP the bridge intercepts it (records args, does NOT run it) and the turn
+# re-emits it as a real tool call so Strix's Runner executes it once and its
+# ``tool_use_behavior`` stops the run cleanly — see the module docstring.
+_LIFECYCLE_TOOLS = frozenset({"finish_scan", "agent_finish"})
 # Wall-clock ceiling for a single delegated turn. A whole task can chain many
 # tool calls, so this is generous — it exists to stop a wedged CLI process
 # hanging the scan forever, not to bound normal work.
@@ -144,21 +163,54 @@ def _mcp_result(text: str, *, is_error: bool = False) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "is_error": is_error}
 
 
-def _make_bridge_tool(tool: FunctionTool) -> SdkMcpTool[Any]:
-    """Wrap one Strix ``FunctionTool`` as an in-process MCP tool.
+class _LifecycleCapture:
+    """Records the first lifecycle tool call intercepted during one turn.
 
-    Calling it invokes the real ``on_invoke_tool`` — the same coroutine
-    Strix's own Runner would call — so the tool actually runs (shell
-    commands execute in the sandbox, proxy requests go out, reports get
-    filed). The ``ToolContext`` is rebuilt from the run context published by
-    ``execution.py`` (:mod:`strix.config.run_context`), so coordination tools
-    that read ``context["coordinator"]`` see the real graph; when no run
-    context is set (e.g. a bare unit test) it falls back to an empty dict.
+    Lifecycle tools (``finish_scan`` / ``agent_finish``) are terminal: Strix's
+    Runner stops the agent the moment one succeeds. If Claude Code executed one
+    itself over MCP, Strix's Runner would never see the tool call and would (a)
+    log a spurious "ended without calling finish_scan" error and (b) let Claude
+    Code keep working past the finish. So the bridge intercepts the call —
+    records its args, returns a success placeholder, runs nothing — and the
+    turn re-emits it as a real function call for Strix to execute once.
     """
 
+    def __init__(self) -> None:
+        self.name: str | None = None
+        self.arguments: str | None = None
+
+    @property
+    def captured(self) -> bool:
+        return self.name is not None
+
+    def record(self, name: str, arguments: str) -> None:
+        if self.name is None:  # keep the first; ignore any trailing extras
+            self.name = name
+            self.arguments = arguments
+
+
+def _make_bridge_tool(tool: FunctionTool, capture: _LifecycleCapture) -> SdkMcpTool[Any]:
+    """Wrap one Strix ``FunctionTool`` as an in-process MCP tool.
+
+    Non-lifecycle tools invoke the real ``on_invoke_tool`` — the same coroutine
+    Strix's own Runner would call — so they actually run (shell commands execute
+    in the sandbox, proxy requests go out, reports get filed). The ``ToolContext``
+    is rebuilt from the run context published by ``execution.py``
+    (:mod:`strix.config.run_context`), so coordination tools that read
+    ``context["coordinator"]`` see the real graph; outside a run it falls back to
+    an empty dict. Lifecycle tools are intercepted into ``capture`` instead of run
+    (see :class:`_LifecycleCapture`).
+    """
+    is_lifecycle = tool.name in _LIFECYCLE_TOOLS
+
     async def _invoke(args: dict[str, Any]) -> dict[str, Any]:
-        call_id = f"claude_code_{uuid.uuid4().hex}"
         args_json = json.dumps(args, ensure_ascii=False)
+        if is_lifecycle:
+            capture.record(tool.name, args_json)
+            return _mcp_result(
+                json.dumps({"success": True, "message": "Recorded; Strix is finalizing the run."})
+            )
+        call_id = f"claude_code_{uuid.uuid4().hex}"
         run_context = active_run_context.get() or {}
         ctx: ToolContext[Any] = ToolContext(
             context=run_context,
@@ -217,12 +269,12 @@ def _as_function_tool(tool: Tool) -> FunctionTool | None:
     return None
 
 
-def _build_mcp_bridge(tools: list[Tool]) -> McpSdkServerConfig | None:
+def _build_mcp_bridge(tools: list[Tool], capture: _LifecycleCapture) -> McpSdkServerConfig | None:
     bridged = [ft for ft in (_as_function_tool(t) for t in tools) if ft is not None]
     if not bridged:
         return None
     return create_sdk_mcp_server(
-        name=_MCP_SERVER_NAME, tools=[_make_bridge_tool(t) for t in bridged]
+        name=_MCP_SERVER_NAME, tools=[_make_bridge_tool(t, capture) for t in bridged]
     )
 
 
@@ -252,7 +304,8 @@ class ClaudeCodeModel(Model):
     ) -> ModelResponse:
         # Not yet used (no prior-response threading, no cross-run conversation
         # state) — required by the Model ABC signature regardless.
-        mcp_server = _build_mcp_bridge(tools)
+        capture = _LifecycleCapture()
+        mcp_server = _build_mcp_bridge(tools, capture)
 
         options = ClaudeAgentOptions(
             model=self.model or None,
@@ -280,6 +333,11 @@ class ClaudeCodeModel(Model):
                         tool_calls += _collect_assistant_blocks(message, text_parts)
                     elif isinstance(message, ResultMessage):
                         usage, turn_error = _usage_from_result(message)
+                    # A lifecycle tool is terminal: stop consuming the CLI turn so
+                    # Claude Code can't keep working past the finish. Exiting the
+                    # loop closes the query generator, ending the CLI turn.
+                    if capture.captured:
+                        break
         except TimeoutError as exc:
             raise RuntimeError(
                 f"claude-code backend turn exceeded {_TURN_TIMEOUT_S:.0f}s and was aborted"
@@ -301,6 +359,21 @@ class ClaudeCodeModel(Model):
 
         if tool_calls:
             logger.info("claude-code turn: completed after %d tool call(s)", tool_calls)
+
+        # A captured lifecycle call is re-emitted as a real function call so
+        # Strix's Runner executes it once and its tool_use_behavior stops the run
+        # authoritatively — no spurious "ended without finish_scan" and no work
+        # past the finish.
+        if capture.captured:
+            logger.info("claude-code turn: finalizing via %s", capture.name)
+            finish_call = ResponseFunctionToolCall(
+                id=f"fc_{uuid.uuid4().hex}",
+                call_id=f"call_{uuid.uuid4().hex}",
+                name=capture.name or "",
+                arguments=capture.arguments or "{}",
+                type="function_call",
+            )
+            return ModelResponse(output=[finish_call], usage=usage, response_id=FAKE_RESPONSES_ID)
 
         text = "\n".join(p for p in text_parts if p)
         output_item = ResponseOutputMessage(
